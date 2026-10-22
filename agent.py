@@ -28,6 +28,11 @@ Examples for other providers:
 
 No third-party dependencies — uses only the standard library.
 
+Tools: `calculator` and `read` (text files and directory listings). The read
+tool is confined to the working directory; set AGENT_READ_ROOT to allow a
+different directory, and AGENT_MAX_READ_LINES / AGENT_MAX_READ_BYTES to tune
+how much a single read returns.
+
 Settings are read from `.env` next to this script (see `.env.example`),
 then from the process environment, which takes precedence.
 """
@@ -77,9 +82,12 @@ MODEL = (
 )
 MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "8"))
 TIMEOUT = float(os.environ.get("OPENAI_TIMEOUT", "60"))
+MAX_READ_LINES = int(os.environ.get("AGENT_MAX_READ_LINES", "2000"))
+MAX_READ_BYTES = int(os.environ.get("AGENT_MAX_READ_BYTES", "1000000"))
 
 SYSTEM_PROMPT = (
-    "You are a helpful assistant. Use the provided tools when needed, "
+    "You are a helpful assistant. Use the provided tools when needed "
+    "(for example, read a file before answering questions about it), "
     "otherwise answer directly."
 )
 
@@ -107,6 +115,88 @@ def tool_calculator(expression: str) -> str:
         return f"Error: {exc}"
 
 
+def read_root() -> Path:
+    """Directory the read tool is allowed to touch."""
+    configured = os.environ.get("AGENT_READ_ROOT")
+    return Path(configured).expanduser().resolve() if configured else Path.cwd().resolve()
+
+
+def tool_read(path: str, offset: int = 1, limit=None) -> str:
+    """Read a UTF-8 text file (or list a directory) under the allowed root."""
+    try:
+        offset = int(offset)
+        limit = MAX_READ_LINES if limit is None else int(limit)
+    except (TypeError, ValueError):
+        return "Error: offset and limit must be integers."
+    if offset < 1:
+        return "Error: offset must be 1 or greater."
+    if limit < 1:
+        return "Error: limit must be 1 or greater."
+
+    root = read_root()
+    target = Path(path).expanduser()
+    if not target.is_absolute():
+        target = root / target
+    resolved = target.resolve()
+
+    # Refuse anything that escapes the root, including via symlinks.
+    if resolved != root and root not in resolved.parents:
+        return f"Error: '{path}' is outside the allowed root ({root})."
+    if not resolved.exists():
+        return f"Error: no such file or directory: {path}"
+
+    if resolved.is_dir():
+        entries = sorted(
+            entry.name + ("/" if entry.is_dir() else "")
+            for entry in resolved.iterdir()
+        )
+        if not entries:
+            return "(empty directory)"
+        if len(entries) > limit:
+            extra = len(entries) - limit
+            entries = entries[:limit] + [f"... ({extra} more entries)"]
+        return "\n".join(entries)
+
+    if not resolved.is_file():
+        return f"Error: not a regular file: {path}"
+
+    with resolved.open("rb") as fh:
+        if b"\x00" in fh.read(4096):
+            return f"Error: '{path}' looks like a binary file; only text is supported."
+        fh.seek(0)
+
+        # Skip to the requested line without loading the whole file.
+        for _ in range(offset - 1):
+            if not fh.readline():
+                return f"Error: offset {offset} is past the end of the file."
+
+        collected = []
+        size = 0
+        truncated = False
+        while len(collected) < limit:
+            line = fh.readline()
+            if not line:
+                break
+            size += len(line)
+            if size > MAX_READ_BYTES:
+                truncated = True
+                break
+            collected.append(line)
+
+        has_more = not truncated and bool(fh.readline())
+
+    if not collected:
+        return "(empty file)"
+
+    lines = b"".join(collected).decode("utf-8", errors="replace").splitlines()
+    out = [f"{offset + i}: {line}" for i, line in enumerate(lines)]
+    if truncated:
+        out.append(f"... (read limit of {MAX_READ_BYTES} bytes reached)")
+    elif has_more:
+        out.append(f"... (more lines; use offset={offset + len(lines)})")
+    return "\n".join(out)
+
+
 TOOLS = [
     {
         "type": "function",
@@ -124,10 +214,41 @@ TOOLS = [
                 "required": ["expression"],
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": (
+                "Read a UTF-8 text file from disk, or list a directory. "
+                "Returns numbered lines. Paths are relative to the working "
+                "directory and must stay inside the allowed root."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File or directory path, e.g. 'agent.py'.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "1-based line number to start reading from (default 1).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": (
+                            f"Maximum number of lines to return (default {MAX_READ_LINES})."
+                        ),
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
 ]
 
-TOOL_IMPL = {"calculator": tool_calculator}
+TOOL_IMPL = {"calculator": tool_calculator, "read": tool_read}
 
 
 # ---------------------------------------------------------------------------
