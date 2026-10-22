@@ -9,7 +9,15 @@ Usage:
     export OPENAI_API_KEY=sk-...                  # optional for local servers
     export OPENAI_BASE_URL=https://api.vikey.ai/v1/chat/completions
     export OPENAI_MODEL=gpt-4o-mini
-    python3 agent.py "What is 12 * 34 plus 5?"
+
+    python3 agent.py "What is 12 * 34 plus 5?"    # single question
+    python3 agent.py                             # interactive multi-turn chat
+
+In interactive mode the whole conversation (including tool calls and their
+results) is kept, so follow-ups like "and multiply that by 2" work. Commands:
+    /help    show help
+    /reset   clear the conversation history
+    /exit    quit (or press Ctrl-D)
 
 Examples for other providers:
     export OPENAI_BASE_URL=https://api.deepseek.com
@@ -74,6 +82,14 @@ SYSTEM_PROMPT = (
     "You are a helpful assistant. Use the provided tools when needed, "
     "otherwise answer directly."
 )
+
+HELP_TEXT = """\
+Commands:
+  /help    show this help
+  /reset   clear the conversation history
+  /exit    quit (or press Ctrl-D)
+
+Anything else is sent to the model as your next message."""
 
 # ---------------------------------------------------------------------------
 # Tools
@@ -175,12 +191,33 @@ def message_text(message) -> str:
 # Agent loop
 # ---------------------------------------------------------------------------
 
-def run(user_input: str) -> str:
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_input},
-    ]
+class Conversation:
+    """A chat history that can be continued across multiple user turns."""
 
+    def __init__(self, system_prompt: str = SYSTEM_PROMPT):
+        self.messages = [{"role": "system", "content": system_prompt}]
+
+    def reset(self):
+        """Drop everything except the system prompt."""
+        self.messages = self.messages[:1]
+
+    def send(self, user_input: str) -> str:
+        """Append a user message, run the agent loop, and return the reply."""
+        start = len(self.messages)
+        self.messages.append({"role": "user", "content": user_input})
+        try:
+            return run_turn(self.messages)
+        except Exception:
+            # Don't leave a dangling user message behind if the call failed.
+            del self.messages[start:]
+            raise
+
+
+def run_turn(messages):
+    """Run the agent loop on `messages` until a final answer is produced.
+
+    The conversation is mutated in place, so callers can keep appending to it.
+    """
     for _ in range(MAX_TURNS):
         response = chat(messages, tools=TOOLS)
         choices = response.get("choices") or []
@@ -233,15 +270,59 @@ def run(user_input: str) -> str:
     return "(stopped: max turns reached)"
 
 
-def main():
-    if len(sys.argv) < 2:
-        sys.exit('Usage: python3 agent.py "your question"')
+def run(user_input: str) -> str:
+    """Single-shot helper: one question, one answer."""
+    return Conversation().send(user_input)
 
-    try:
-        answer = run(" ".join(sys.argv[1:]))
-    except RuntimeError as exc:
-        sys.exit(str(exc))
-    print(answer)
+
+def repl(conversation=None):
+    """Interactive chat loop that keeps context between messages."""
+    conversation = conversation or Conversation()
+    print("Interactive chat — type /help for commands, /exit to quit.")
+
+    while True:
+        try:
+            line = input("you> ").strip()
+        except EOFError:
+            print()
+            break
+        except KeyboardInterrupt:
+            print("\n(interrupted — /exit to quit)")
+            continue
+
+        if not line:
+            continue
+
+        command = line.lower()
+        if command in ("/exit", "/quit"):
+            break
+        if command == "/help":
+            print(HELP_TEXT)
+            continue
+        if command == "/reset":
+            conversation.reset()
+            print("(conversation cleared)")
+            continue
+
+        try:
+            answer = conversation.send(line)
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            continue
+
+        print(f"\nassistant> {answer}")
+
+
+def main():
+    if len(sys.argv) > 1:
+        try:
+            answer = run(" ".join(sys.argv[1:]))
+        except RuntimeError as exc:
+            sys.exit(str(exc))
+        print(answer)
+        return
+
+    repl()
 
 
 if __name__ == "__main__":
