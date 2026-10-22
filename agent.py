@@ -87,12 +87,33 @@ TIMEOUT = float(os.environ.get("OPENAI_TIMEOUT", "60"))
 MAX_READ_LINES = int(os.environ.get("AGENT_MAX_READ_LINES", "2000"))
 MAX_READ_BYTES = int(os.environ.get("AGENT_MAX_READ_BYTES", "1000000"))
 
-SYSTEM_PROMPT = (
-    "You are a helpful assistant. Use the provided tools when needed. "
-    "Read a file before answering questions about it, and read before "
-    "editing; prefer 'edit' over 'write' for changes to existing files. "
-    "Otherwise answer directly."
-)
+def build_system_prompt(cwd=None) -> str:
+    cwd_text = str(cwd if cwd is not None else Path.cwd()).replace("\\", "/")
+    return f"""You are an expert coding assistant operating inside a minimal agent harness. You help users by reading files, editing code, writing new files, and doing calculations.
+
+<tools>
+- calculator: Evaluate arithmetic expressions
+- read: Read file contents, or list a directory
+- edit: Make precise file edits with exact text replacement
+- write: Create or overwrite files
+
+In addition to the tools above, you may have access to other custom tools depending on the project.
+</tools>
+
+<rules>
+- Use read to examine files before answering questions about them and before editing them
+- Use edit for precise changes (old_string must match exactly)
+- Keep old_string as small as possible while still being unique in the file; do not pad with large unchanged regions
+- Pass replace_all=true when the same change should be applied everywhere
+- Use write only for new files or complete rewrites
+- File paths resolve against the working directory; paths outside it are rejected
+- Be concise in your responses
+- Show file paths clearly when working with files
+</rules>
+
+<cwd>
+{cwd_text}
+</cwd>"""
 
 HELP_TEXT = """\
 Commands:
@@ -498,8 +519,9 @@ def message_text(message) -> str:
 class Conversation:
     """A chat history that can be continued across multiple user turns."""
 
-    def __init__(self, system_prompt: str = SYSTEM_PROMPT):
-        self.messages = [{"role": "system", "content": system_prompt}]
+    def __init__(self, system_prompt=None):
+        prompt = system_prompt if system_prompt is not None else build_system_prompt()
+        self.messages = [{"role": "system", "content": prompt}]
 
     def reset(self):
         """Drop everything except the system prompt."""
