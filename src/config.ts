@@ -12,8 +12,18 @@ export interface Config {
   timeoutMs: number;
   maxReadLines: number;
   maxReadBytes: number;
-  /** Absolute directory the file tools are confined to. */
+  /** Bytes of combined stdout/stderr returned by the bash tool. */
+  maxOutputBytes: number;
+  /** Default timeout for a bash command. */
+  bashTimeoutMs: number;
+  /** Absolute directory the file and bash tools are confined to. */
   root: string;
+  /** Run tools that normally need approval without asking. */
+  yolo: boolean;
+  /** Block reads of secret-looking files and scrub secrets from bash env. */
+  protectSecrets: boolean;
+  /** Environment variable names to pass through to bash despite the scrub. */
+  bashEnvAllow: string[];
 }
 
 export const DEFAULT_BASE_URL = 'https://api.vikey.ai/v1/chat/completions';
@@ -90,6 +100,20 @@ function floatEnv(
   return value;
 }
 
+function booleanEnv(
+  env: NodeJS.ProcessEnv,
+  name: string,
+  fallback: boolean,
+): boolean {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+
+  const value = raw.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(value)) return true;
+  if (['0', 'false', 'no', 'off'].includes(value)) return false;
+  throw new Error(`${name} must be a boolean (got ${JSON.stringify(raw)}).`);
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const configuredRoot =
     env.AGENT_ROOT || env.AGENT_READ_ROOT || process.cwd();
@@ -103,6 +127,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     timeoutMs: floatEnv(env, 'OPENAI_TIMEOUT', 60) * 1000,
     maxReadLines: integerEnv(env, 'AGENT_MAX_READ_LINES', 2000),
     maxReadBytes: integerEnv(env, 'AGENT_MAX_READ_BYTES', 1_000_000),
+    maxOutputBytes: integerEnv(env, 'AGENT_MAX_OUTPUT_BYTES', 100_000),
+    bashTimeoutMs: floatEnv(env, 'AGENT_BASH_TIMEOUT', 120) * 1000,
     root: canonicalRoot(configuredRoot),
+    yolo: booleanEnv(env, 'AGENT_YOLO', false),
+    protectSecrets: booleanEnv(env, 'AGENT_PROTECT_SECRETS', true),
+    bashEnvAllow: (env.AGENT_BASH_ENV_ALLOW ?? '')
+      .split(',')
+      .map((name) => name.trim())
+      .filter(Boolean),
   };
 }

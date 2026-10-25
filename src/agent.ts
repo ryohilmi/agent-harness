@@ -1,7 +1,8 @@
 import { chatStream } from './llm.js';
 import type { Config } from './config.js';
 import { buildSystemPrompt } from './system-prompt.js';
-import type { ToolRegistry } from './tools/index.js';
+import { summarizeToolCall, type ToolRegistry } from './tools/index.js';
+import { mentionsSecretPath } from './tools/secrets.js';
 import type { ChatMessage, ToolCall } from './types.js';
 
 export interface AgentEvents {
@@ -16,9 +17,66 @@ export interface AgentEvents {
   onToolEnd?: (call: ToolCall, result: string, durationMs: number) => void;
 }
 
+/** One tool call that needs an explicit yes/no from the user. */
+export interface ApprovalRequest {
+  name: string;
+  /** One-line description, e.g. the shell command. */
+  summary: string;
+  args: Record<string, unknown>;
+  /** Extra caution to show above the prompt. */
+  warning?: string;
+}
+
 export interface SendOptions {
   events?: AgentEvents;
   signal?: AbortSignal;
+  /**
+   * Called before a tool that requires approval runs. Resolve false to skip
+   * it. When omitted, such tools fail closed with an explanatory error.
+   */
+  approve?: (request: ApprovalRequest) => Promise<boolean>;
+}
+
+function approvalWarning(
+  name: string,
+  args: Record<string, unknown>,
+): string | undefined {
+  if (name === 'bash' && typeof args.command === 'string') {
+    if (mentionsSecretPath(args.command)) {
+      return 'This command mentions files or directories that usually hold secrets.';
+    }
+  }
+  return undefined;
+}
+
+async function callTool(
+  name: string,
+  rawArguments: string,
+  args: Record<string, unknown> | null,
+  tools: ToolRegistry,
+  approve: SendOptions['approve'],
+): Promise<string> {
+  if (!args || !tools.requiresApproval(name)) {
+    return tools.execute(name, rawArguments);
+  }
+
+  const request: ApprovalRequest = {
+    name,
+    summary: summarizeToolCall(name, args),
+    args,
+    warning: approvalWarning(name, args),
+  };
+
+  // Fail closed when there is no way to ask, e.g. a piped single-shot run.
+  if (!approve) {
+    return `Error: '${name}' requires interactive approval, but no approval prompt is available. Ask the user to approve it, or rerun the harness with --yolo to allow tool execution without approval.`;
+  }
+
+  if (!(await approve(request))) {
+    return `Error: the user denied this ${name} call. Do not retry it; explain what you wanted to do and ask how to proceed.`;
+  }
+
+  return tools.execute(name, rawArguments);
 }
 
 export function messageText(message: ChatMessage): string {
@@ -68,10 +126,17 @@ export async function runTurn(
     for (const call of calls) {
       const name = call.function?.name ?? '';
       const rawArguments = call.function?.arguments || '{}';
-      events.onToolStart?.(call, parseToolArguments(rawArguments));
+      const args = parseToolArguments(rawArguments);
+      events.onToolStart?.(call, args);
 
       const started = Date.now();
-      const result = await tools.execute(name, rawArguments);
+      const result = await callTool(
+        name,
+        rawArguments,
+        args,
+        tools,
+        options.approve,
+      );
       const durationMs = Date.now() - started;
 
       events.onToolEnd?.(call, result, durationMs);

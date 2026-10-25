@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import type { Config } from '../config.js';
 import { integerArg, requireString } from './args.js';
 import { resolveInRoot } from './fs.js';
+import { secretPathReason } from './secrets.js';
 
 interface Line {
   data: Buffer;
@@ -76,6 +77,13 @@ export async function readTool(
 
   const resolved = resolveInRoot(path, config.root);
   if (!resolved.ok) return resolved.error;
+
+  if (config.protectSecrets) {
+    const reason = secretPathReason(resolved.path);
+    if (reason) {
+      return `Error: refusing to read '${path}': ${reason}. Ask the user to share any value you actually need; do not try to work around this.`;
+    }
+  }
 
   let fileStat;
   try {

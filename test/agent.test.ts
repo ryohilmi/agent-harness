@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Conversation } from '../src/agent.js';
+import { Conversation, type ApprovalRequest } from '../src/agent.js';
 import { loadConfig } from '../src/config.js';
 import { createTools } from '../src/tools/index.js';
 import type { ChatMessage } from '../src/types.js';
@@ -225,4 +225,121 @@ test('reset keeps only the system prompt', () => {
 
   assert.equal(conversation.messages.length, 1);
   assert.equal(conversation.messages[0]?.role, 'system');
+});
+
+function approvalServer(
+  command: string,
+): (request: IncomingMessage, response: ServerResponse) => void {
+  let requests = 0;
+
+  return (request, response) => {
+    void readBody(request).then((body) => {
+      requests += 1;
+      if (requests === 1) {
+        sse(
+          response,
+          toolCall('bash', JSON.stringify({ command })),
+        );
+        return;
+      }
+
+      const payload = JSON.parse(body) as { messages: ChatMessage[] };
+      const tool = payload.messages.find((message) => message.role === 'tool');
+      sse(response, [
+        { choices: [{ delta: { content: String(tool?.content) } }] },
+        { choices: [{ delta: {}, finish_reason: 'stop' }] },
+      ]);
+    });
+  };
+}
+
+test('asks for approval and skips a denied bash call', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-harness-agent-'));
+  const seen: { request?: ApprovalRequest } = {};
+
+  await withServer(
+    approvalServer('cat .env && echo hi > made.txt'),
+    async (baseUrl) => {
+      try {
+        const config = loadConfig({
+          OPENAI_BASE_URL: baseUrl,
+          OPENAI_MODEL: 'mock',
+          AGENT_ROOT: root,
+        });
+        const conversation = new Conversation(config, createTools(config));
+
+        const answer = await conversation.send('read the env file', {
+          approve: async (request) => {
+            seen.request = request;
+            return false;
+          },
+        });
+
+        assert.equal(seen.request?.name, 'bash');
+        assert.match(seen.request?.summary ?? '', /cat \.env/);
+        assert.match(seen.request?.warning ?? '', /hold secrets/);
+        assert.match(answer, /denied this bash call/);
+        assert.equal(existsSync(join(root, 'made.txt')), false);
+
+        const toolMessage = conversation.messages.find(
+          (message) => message.role === 'tool',
+        );
+        assert.match(String(toolMessage?.content), /Do not retry/);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+test('fails closed when no approval prompt is available', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-harness-agent-'));
+
+  await withServer(
+    approvalServer('echo hi > made.txt'),
+    async (baseUrl) => {
+      try {
+        const config = loadConfig({
+          OPENAI_BASE_URL: baseUrl,
+          OPENAI_MODEL: 'mock',
+          AGENT_ROOT: root,
+        });
+        const conversation = new Conversation(config, createTools(config));
+
+        const answer = await conversation.send('write a file');
+
+        assert.match(answer, /requires interactive approval/);
+        assert.match(answer, /--yolo/);
+        assert.equal(existsSync(join(root, 'made.txt')), false);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+test('runs bash after approval', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-harness-agent-'));
+
+  await withServer(
+    approvalServer('echo hi > made.txt'),
+    async (baseUrl) => {
+      try {
+        const config = loadConfig({
+          OPENAI_BASE_URL: baseUrl,
+          OPENAI_MODEL: 'mock',
+          AGENT_ROOT: root,
+        });
+        const conversation = new Conversation(config, createTools(config));
+
+        await conversation.send('write a file', {
+          approve: async () => true,
+        });
+
+        assert.equal(readFileSync(join(root, 'made.txt'), 'utf8'), 'hi\n');
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 });

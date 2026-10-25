@@ -1,5 +1,6 @@
 import type { Config } from '../config.js';
 import type { ToolSchema } from '../types.js';
+import { bashTool } from './bash.js';
 import { evaluateExpression } from './calculator.js';
 import { editTool } from './edit.js';
 import { readTool } from './read.js';
@@ -7,18 +8,30 @@ import { writeTool } from './write.js';
 
 export interface ToolDefinition {
   schema: ToolSchema;
+  /** Ask the user before running this tool (used by `bash`). */
+  requiresApproval?: boolean;
   run(args: Record<string, unknown>): Promise<string> | string;
 }
 
 export class ToolRegistry {
   private readonly byName: Map<string, ToolDefinition>;
+  private readonly approvalNames: Set<string>;
   readonly schemas: ToolSchema[];
 
   constructor(definitions: ToolDefinition[]) {
     this.byName = new Map(
       definitions.map((definition) => [definition.schema.function.name, definition]),
     );
+    this.approvalNames = new Set(
+      definitions
+        .filter((definition) => definition.requiresApproval)
+        .map((definition) => definition.schema.function.name),
+    );
     this.schemas = definitions.map((definition) => definition.schema);
+  }
+
+  requiresApproval(name: string): boolean {
+    return this.approvalNames.has(name);
   }
 
   /**
@@ -45,6 +58,45 @@ export class ToolRegistry {
     } catch (error) {
       return `Error: ${error instanceof Error ? error.message : String(error)}`;
     }
+  }
+}
+
+function oneLine(text: string, max = 300): string {
+  const flattened = text.replace(/\s+/g, ' ').trim();
+  return flattened.length > max
+    ? `${flattened.slice(0, max - 1)}…`
+    : flattened;
+}
+
+/** A one-line description of a tool call, used in approval prompts. */
+export function summarizeToolCall(
+  name: string,
+  args: Record<string, unknown> | null,
+): string {
+  if (!args) return name;
+
+  const stringArg = (key: string): string =>
+    typeof args[key] === 'string' ? (args[key] as string) : '';
+
+  switch (name) {
+    case 'bash': {
+      const command = oneLine(stringArg('command'), 200);
+      const cwd = stringArg('cwd');
+      return cwd ? `${command}  (cwd: ${cwd})` : command;
+    }
+    case 'read': {
+      const parts = [stringArg('path')];
+      if (args.offset !== undefined) parts.push(`offset=${String(args.offset)}`);
+      if (args.limit !== undefined) parts.push(`limit=${String(args.limit)}`);
+      return oneLine(parts.filter(Boolean).join(' '));
+    }
+    case 'write':
+    case 'edit':
+      return oneLine(stringArg('path'));
+    case 'calculator':
+      return oneLine(stringArg('expression'));
+    default:
+      return oneLine(`${name} ${JSON.stringify(args)}`);
   }
 }
 
@@ -75,6 +127,42 @@ export function createTools(config: Config): ToolRegistry {
         }
         return evaluateExpression(expression);
       },
+    },
+    {
+      requiresApproval: true,
+      schema: {
+        type: 'function',
+        function: {
+          name: 'bash',
+          description:
+            'Run a command with bash in the workspace root. Use this to run ' +
+            'tests, builds, git, and other shell commands. The command runs ' +
+            'without stdin, so avoid interactive programs. Returns stdout, ' +
+            'stderr, and the exit code; long output is truncated. The user ' +
+            'must approve each call unless yolo mode is on.',
+          parameters: {
+            type: 'object',
+            properties: {
+              command: {
+                type: 'string',
+                description: "Shell command, e.g. 'npm test'.",
+              },
+              cwd: {
+                type: 'string',
+                description:
+                  'Directory to run in, relative to the workspace root ' +
+                  '(default: the root). Must stay inside the root.',
+              },
+              timeout_ms: {
+                type: 'integer',
+                description: `Timeout in milliseconds (default ${config.bashTimeoutMs}).`,
+              },
+            },
+            required: ['command'],
+          },
+        },
+      },
+      run: (args) => bashTool(config, args),
     },
     {
       schema: {

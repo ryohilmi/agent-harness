@@ -2,6 +2,7 @@
 import { stdin, stdout, stderr, argv } from 'node:process';
 import { createInterface } from 'node:readline/promises';
 import { Conversation } from './agent.js';
+import { alwaysApprove, createApprover, type Approver } from './approval.js';
 import { loadConfig, loadProjectEnv, type Config } from './config.js';
 import { HELP_TEXT } from './system-prompt.js';
 import { createTools, type ToolRegistry } from './tools/index.js';
@@ -17,6 +18,7 @@ Usage:
 
 Options:
   --no-tui       use the plain readline interface instead of the Ink TUI
+  -y, --yolo     run tool calls without asking for approval (dangerous)
   -h, --help     show this help
   -v, --version  show the version
 
@@ -29,6 +31,9 @@ Environment:
   AGENT_ROOT                       directory the file tools may touch
   AGENT_MAX_READ_LINES             default: 2000
   AGENT_MAX_READ_BYTES             default: 1000000
+  AGENT_YOLO                       default: 0; same as --yolo
+  AGENT_PROTECT_SECRETS            default: 1; block secret files, scrub bash env
+  AGENT_BASH_ENV_ALLOW             comma-separated names to keep in bash env
 
 Settings are read from .env next to package.json, then from the process
 environment (which takes precedence).`;
@@ -43,17 +48,38 @@ async function runOnce(
   prompt: string,
   config: Config,
   tools: ToolRegistry,
+  approver?: Approver,
 ): Promise<void> {
   const conversation = new Conversation(config, tools);
-  const answer = await conversation.send(prompt);
-  stdout.write(`${answer}\n`);
+
+  try {
+    const answer = await conversation.send(prompt, {
+      approve: approver ? (request) => approver.approve(request) : undefined,
+    });
+    stdout.write(`${answer}\n`);
+  } finally {
+    approver?.close();
+  }
+}
+
+/** An approver for a one-off run; undefined means tools fail closed. */
+function oneShotApprover(config: Config): Approver | undefined {
+  if (config.yolo) return alwaysApprove();
+  if (!stdin.isTTY) return undefined;
+  return createApprover();
 }
 
 async function repl(config: Config, tools: ToolRegistry): Promise<void> {
   const conversation = new Conversation(config, tools);
   const terminal = createInterface({ input: stdin, output: stdout });
+  const approver = config.yolo
+    ? alwaysApprove()
+    : createApprover({ terminal });
 
   stdout.write('Interactive chat — type /help for commands, /exit to quit.\n');
+  if (config.yolo) {
+    stdout.write('yolo mode is on: tool calls run without approval.\n');
+  }
 
   try {
     for (;;) {
@@ -80,7 +106,9 @@ async function repl(config: Config, tools: ToolRegistry): Promise<void> {
       }
 
       try {
-        const answer = await conversation.send(line);
+        const answer = await conversation.send(line, {
+          approve: (request) => approver.approve(request),
+        });
         stdout.write(`\nassistant> ${answer}\n`);
       } catch (error) {
         stderr.write(
@@ -89,12 +117,14 @@ async function repl(config: Config, tools: ToolRegistry): Promise<void> {
       }
     }
   } finally {
+    approver.close();
     terminal.close();
   }
 }
 
 async function main(): Promise<void> {
   let noTui = false;
+  let yolo = false;
   const promptParts: string[] = [];
   let literal = false;
 
@@ -108,6 +138,8 @@ async function main(): Promise<void> {
       literal = true;
     } else if (argument === '--no-tui') {
       noTui = true;
+    } else if (argument === '-y' || argument === '--yolo') {
+      yolo = true;
     } else if (argument === '-h' || argument === '--help') {
       stdout.write(`${USAGE}\n`);
       return;
@@ -121,12 +153,13 @@ async function main(): Promise<void> {
 
   loadProjectEnv();
   const config = loadConfig();
+  if (yolo) config.yolo = true;
   const tools = createTools(config);
 
   const prompt = promptParts.join(' ');
 
   if (prompt) {
-    await runOnce(prompt, config, tools);
+    await runOnce(prompt, config, tools, oneShotApprover(config));
     return;
   }
 
@@ -136,7 +169,7 @@ async function main(): Promise<void> {
       stdout.write(`${USAGE}\n`);
       return;
     }
-    await runOnce(piped, config, tools);
+    await runOnce(piped, config, tools, oneShotApprover(config));
     return;
   }
 

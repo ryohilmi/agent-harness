@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Box, Static, Text, render, useApp, useInput } from 'ink';
 import TextInput from 'ink-text-input';
-import { Conversation } from './agent.js';
+import { Conversation, type ApprovalRequest } from './agent.js';
 import type { Config } from './config.js';
 import { HELP_TEXT } from './system-prompt.js';
 import type { ToolRegistry } from './tools/index.js';
@@ -65,6 +65,14 @@ function formatToolDetail(
     case 'write':
     case 'edit':
       return oneLine(stringArg('path'), 80);
+    case 'bash': {
+      const parts = [stringArg('command')];
+      if (args.cwd !== undefined) parts.push(`cwd=${stringArg('cwd')}`);
+      if (args.timeout_ms !== undefined) {
+        parts.push(`timeout=${String(args.timeout_ms)}ms`);
+      }
+      return oneLine(parts.filter(Boolean).join(', '), 100);
+    }
     default:
       return oneLine(JSON.stringify(args), 80);
   }
@@ -185,19 +193,40 @@ export function App({ config, tools }: { config: Config; tools: ToolRegistry }) 
   const busyRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
   const toolDetailRef = useRef(new Map<ToolCall, string>());
+  const autoApproveRef = useRef(false);
+  const approvalRef = useRef<((approved: boolean) => void) | null>(null);
 
   const [committed, setCommitted] = useState<Entry[]>([
     {
       id: 0,
       kind: 'notice',
       tone: 'info',
-      text: `agent-harness · ${config.model}\nroot: ${config.root}\n\nType /help for commands, /exit to quit.`,
+      text: `agent-harness · ${config.model}\nroot: ${config.root}${
+        config.yolo ? '\nyolo: tool calls run without approval' : ''
+      }\n\nType /help for commands, /exit to quit.`,
     },
   ]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [liveText, setLiveText] = useState('');
   const [liveTool, setLiveTool] = useState<LiveTool | null>(null);
+  const [approval, setApproval] = useState<ApprovalRequest | null>(null);
+
+  const settleApproval = (approved: boolean): void => {
+    const resolve = approvalRef.current;
+    approvalRef.current = null;
+    setApproval(null);
+    resolve?.(approved);
+  };
+
+  const requestApproval = (request: ApprovalRequest): Promise<boolean> => {
+    if (config.yolo || autoApproveRef.current) return Promise.resolve(true);
+
+    return new Promise<boolean>((resolve) => {
+      approvalRef.current = resolve;
+      setApproval(request);
+    });
+  };
 
   const commit = (entry: NewEntry): void => {
     const id = nextId.current++;
@@ -210,6 +239,33 @@ export function App({ config, tools }: { config: Config; tools: ToolRegistry }) 
   };
 
   useInput((character, key) => {
+    if (approvalRef.current) {
+      if (key.ctrl && character === 'c') {
+        settleApproval(false);
+        abortRef.current?.abort();
+        return;
+      }
+      if (character === 'y' || character === 'Y' || key.return) {
+        settleApproval(true);
+        return;
+      }
+      if (character === 'a' || character === 'A') {
+        autoApproveRef.current = true;
+        settleApproval(true);
+        commit({
+          kind: 'notice',
+          tone: 'warn',
+          text: '(auto-approving tool calls for this session)',
+        });
+        return;
+      }
+      if (character === 'n' || character === 'N' || key.escape) {
+        settleApproval(false);
+        return;
+      }
+      return;
+    }
+
     if (key.ctrl && character === 'c') {
       if (busyRef.current) {
         abortRef.current?.abort();
@@ -274,6 +330,7 @@ export function App({ config, tools }: { config: Config; tools: ToolRegistry }) 
     try {
       const answer = await conversation.send(text, {
         signal: controller.signal,
+        approve: requestApproval,
         events: {
           onText: (delta) => setLiveText((current) => current + delta),
           onAssistantMessage,
@@ -317,6 +374,7 @@ export function App({ config, tools }: { config: Config; tools: ToolRegistry }) 
         });
       }
     } finally {
+      if (approvalRef.current) settleApproval(false);
       abortRef.current = null;
       busyRef.current = false;
       setBusy(false);
@@ -360,12 +418,33 @@ export function App({ config, tools }: { config: Config; tools: ToolRegistry }) 
         </Box>
       ) : null}
 
+      {approval ? (
+        <Box
+          flexDirection="column"
+          marginTop={1}
+          borderStyle="round"
+          borderColor="yellow"
+          paddingX={1}
+        >
+          <Text color="yellow" bold>
+            approve {approval.name}?
+          </Text>
+          <Text>{approval.summary}</Text>
+          {approval.warning ? (
+            <Text color="red">{approval.warning}</Text>
+          ) : null}
+          <Text dimColor>y run once · a always · n deny</Text>
+        </Box>
+      ) : null}
+
       <Box marginTop={1}>
         <Text color="cyan" bold>
           you
         </Text>
         <Text dimColor> › </Text>
-        {busy ? (
+        {approval ? (
+          <Text color="yellow">(waiting for approval)</Text>
+        ) : busy ? (
           <Text dimColor>(waiting — ctrl+c to cancel)</Text>
         ) : (
           <TextInput
@@ -379,7 +458,9 @@ export function App({ config, tools }: { config: Config; tools: ToolRegistry }) 
 
       <Box marginTop={1}>
         <Text dimColor>
-          enter send · ctrl+c {busy ? 'cancel' : 'exit'} · /help commands
+          {approval
+            ? 'y approve · a always · n deny · ctrl+c cancel'
+            : `enter send · ctrl+c ${busy ? 'cancel' : 'exit'} · /help commands`}
         </Text>
       </Box>
     </Box>

@@ -116,6 +116,47 @@ test('read detects binary files', async () => {
   }
 });
 
+test('read refuses secret files but allows templates', async () => {
+  const { root, tools, cleanup } = fixture();
+
+  try {
+    writeFileSync(join(root, '.env'), 'OPENAI_API_KEY=sk-do-not-leak\n');
+    writeFileSync(join(root, '.env.example'), 'OPENAI_API_KEY=\n');
+    mkdirSync(join(root, '.ssh'));
+    writeFileSync(join(root, '.ssh', 'id_rsa'), 'RSA-MATERIAL-XYZ');
+
+    for (const path of ['.env', '.ssh/id_rsa']) {
+      const result = await tools.execute('read', JSON.stringify({ path }));
+      assert.match(result, /refusing to read/);
+      assert.doesNotMatch(result, /sk-do-not-leak|RSA-MATERIAL-XYZ/);
+    }
+
+    assert.equal(
+      await tools.execute('read', JSON.stringify({ path: '.env.example' })),
+      '1: OPENAI_API_KEY=',
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test('AGENT_PROTECT_SECRETS=0 disables the read denylist', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-harness-tools-'));
+  const config = loadConfig({ AGENT_ROOT: root, AGENT_PROTECT_SECRETS: '0' });
+  const tools = createTools(config);
+
+  try {
+    writeFileSync(join(root, '.env'), 'TOKEN=visible\n');
+
+    assert.equal(
+      await tools.execute('read', JSON.stringify({ path: '.env' })),
+      '1: TOKEN=visible',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('edit replaces unique text and refuses ambiguous matches', async () => {
   const { root, tools, cleanup } = fixture();
 
@@ -233,6 +274,156 @@ test('edit validates its arguments', async () => {
       "Error: old_string not found in 'file.txt'.",
     );
   } finally {
+    cleanup();
+  }
+});
+
+test('bash runs commands in the workspace root', async () => {
+  const { config, root, tools, cleanup } = fixture();
+
+  try {
+    writeFileSync(join(root, 'note.txt'), 'hello');
+
+    assert.equal(
+      await tools.execute('bash', JSON.stringify({ command: 'pwd' })),
+      `${config.root}\n[exit code 0]`,
+    );
+
+    assert.equal(
+      await tools.execute('bash', JSON.stringify({ command: 'cat note.txt' })),
+      'hello\n[exit code 0]',
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test('bash reports stderr and a non-zero exit code', async () => {
+  const { tools, cleanup } = fixture();
+
+  try {
+    const result = await tools.execute(
+      'bash',
+      JSON.stringify({ command: 'echo out; echo err >&2; exit 3' }),
+    );
+
+    assert.match(result, /^out$/m);
+    assert.match(result, /\[stderr\]\nerr/);
+    assert.match(result, /\[exit code 3\]$/);
+  } finally {
+    cleanup();
+  }
+});
+
+test('bash honours cwd and keeps it inside the root', async () => {
+  const { config, root, tools, cleanup } = fixture();
+
+  try {
+    mkdirSync(join(root, 'sub'));
+
+    assert.equal(
+      await tools.execute(
+        'bash',
+        JSON.stringify({ command: 'pwd', cwd: 'sub' }),
+      ),
+      `${join(config.root, 'sub')}\n[exit code 0]`,
+    );
+
+    assert.match(
+      await tools.execute(
+        'bash',
+        JSON.stringify({ command: 'pwd', cwd: '../..' }),
+      ),
+      /is outside the allowed root/,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test('bash kills commands that exceed the timeout', async () => {
+  const { tools, cleanup } = fixture();
+
+  try {
+    const started = Date.now();
+    const result = await tools.execute(
+      'bash',
+      JSON.stringify({ command: 'sleep 5', timeout_ms: 100 }),
+    );
+
+    assert.match(result, /\[timed out after 100 ms\]/);
+    assert.ok(Date.now() - started < 3000, 'timeout should kill the command');
+  } finally {
+    cleanup();
+  }
+});
+
+test('bash truncates large output', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-harness-tools-'));
+  const config = {
+    ...loadConfig({ AGENT_ROOT: root }),
+    maxOutputBytes: 16,
+  };
+  const tools = createTools(config);
+
+  try {
+    const result = await tools.execute(
+      'bash',
+      JSON.stringify({ command: "printf 'abcdefghijklmnopqrstuvwxyz'" }),
+    );
+
+    assert.ok(
+      result.startsWith('abcdefghijklmnop'),
+      `unexpected result: ${JSON.stringify(result)}`,
+    );
+    assert.match(result, /\[output truncated at 16 bytes/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('bash validates its arguments', async () => {
+  const { tools, cleanup } = fixture();
+
+  try {
+    assert.equal(
+      await tools.execute('bash', JSON.stringify({ command: '   ' })),
+      'Error: command must not be empty.',
+    );
+
+    assert.equal(
+      await tools.execute(
+        'bash',
+        JSON.stringify({ command: 'true', timeout_ms: 0 }),
+      ),
+      'Error: timeout_ms must be 1 or greater.',
+    );
+
+    assert.equal(
+      await tools.execute('bash', '{}'),
+      "Error: argument 'command' must be a string",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test('bash does not expose secret-looking environment variables', async () => {
+  const { tools, cleanup } = fixture();
+  process.env.AGENT_TEST_FAKE_TOKEN = 'super-secret';
+
+  try {
+    const result = await tools.execute(
+      'bash',
+      JSON.stringify({
+        command: 'printenv AGENT_TEST_FAKE_TOKEN || echo unset',
+      }),
+    );
+
+    assert.match(result, /^unset$/m);
+    assert.doesNotMatch(result, /super-secret/);
+  } finally {
+    delete process.env.AGENT_TEST_FAKE_TOKEN;
     cleanup();
   }
 });
